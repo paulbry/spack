@@ -11,7 +11,7 @@ import tempfile
 
 import subprocess
 from jsonschema import validate, ValidationError
-from six import iteritems
+from six import iteritems, itervalues, next
 
 import llnl.util.tty as tty
 
@@ -20,7 +20,7 @@ from spack.dependency import all_deptypes
 from spack.spec import Spec, CompilerSpec
 from spack.paths import spack_root
 from spack.error import SpackError
-from spack.schema.os_container_mapping import schema as mapping_schema
+from spack.schema.os_runner_mapping import schema as mapping_schema
 from spack.schema.specs_deps import schema as specs_deps_schema
 from spack.spec_set import CombinatorialSpecSet
 import spack.util.spack_yaml as syaml
@@ -62,9 +62,14 @@ def setup_parser(subparser):
     subparser.add_argument(
         '--resolve-deps-locally', action='store_true', default=False,
         help="Use only the current machine to concretize specs, " +
-        "instead of iterating over items in os-container-mapping.yaml " +
-        "and using docker run.  Assumes the current machine architecure " +
-        "is listed in the os-container-mapping.yaml config file.")
+             "instead of iterating over items in os-runner-mapping.yaml " +
+             "and using docker run.  Assumes the current machine architecure " +
+             "is listed in the os-runner-mapping.yaml config file.")
+
+    subparser.add_argument(
+        '-r', '--runner-mapping', default=None,
+        help="Iterate over items in os-runner-mapping.yaml " +
+             "and use those resources as opposed to system default")
 
     subparser.add_argument(
         '--specs-deps-output', default='/dev/stdout',
@@ -79,6 +84,16 @@ def setup_parser(subparser):
              "file describing the set of release specs to include in the " +
              ".gitlab-ci.yml file.")
 
+    subparser.add_argument(
+        '--job-script', default='./bin/rebuild-package.sh',
+        help="This script represents a gitlab-ci job, corresponding to a " +
+             "single release spec.")
+
+    subparser.add_argument(
+        '--index-script', default='./bin/rebuild-index.sh',
+        help="This script represent the process to update the index " +
+             "of a buildcache on final location"
+    )
 
 def get_job_name(spec, osarch):
     return '{0} {1} {2} {3}'.format(spec.name, spec.version,
@@ -210,7 +225,7 @@ def get_spec_dependencies(specs, deps, spec_labels, image=None):
             _add_dependency(entry['spec'], entry['depends'], deps)
 
 
-def stage_spec_jobs(spec_set, containers, current_system=None):
+def stage_spec_jobs(spec_set, runners, current_system=None):
     """Take a set of release specs along with a dictionary describing the
         available docker containers and what compilers they have, and generate
         a list of "stages", where the jobs in any stage are dependent only on
@@ -220,10 +235,10 @@ def stage_spec_jobs(spec_set, containers, current_system=None):
     Arguments:
         spec_set (CombinatorialSpecSet): Iterable containing all the specs
             to build.
-        containers (dict): Describes the docker containers available to use
+        runners (dict): Describes the runners available to use
             for concretizing specs (and also for the gitlab runners to use
             for building packages).  The schema can be found at
-            "lib/spack/spack/schema/os_container_mapping.py"
+            "lib/spack/spack/schema/os_runner_mapping.py"
         current_system (string): If provided, this indicates not to use the
             containers for concretizing the release specs, but rather just
             assume the current system is in the "containers" dictionary.  A
@@ -266,44 +281,46 @@ def stage_spec_jobs(spec_set, containers, current_system=None):
     spec_labels = {}
 
     if current_system:
-        if current_system not in containers:
+        if current_system not in runners:
             error_msg = ' '.join(['Current system ({0}) does not appear in',
-                                  'os_container_mapping.yaml, ignoring',
+                                  'os_runner_mapping.yaml, ignoring',
                                   'request']).format(
                 current_system)
             raise SpackError(error_msg)
         os_names = [current_system]
     else:
-        os_names = [name for name in containers]
+        os_names = [name for name in runners]
 
-    container_specs = {}
+    runner_specs = {}
     for name in os_names:
-        container_specs[name] = {'image': None, 'specs': []}
+        runner_specs[name] = {'specs': []}
 
     # Collect together all the specs that should be concretized in each
     # container so they can all be done at once, avoiding the need to
     # run the docker container for each spec separately.
     for spec in spec_set:
         for osname in os_names:
-            container_info = containers[osname]
-            image = None if current_system else container_info['image']
+            runner_info = runners[osname]
+            image = None if current_system else runner_info.get('image')
+
             if image:
-                container_specs[osname]['image'] = image
-            if 'compilers' in container_info:
+                runner_specs[osname]['image'] = image
+
+            if 'compilers' in runner_info:
                 found_at_least_one = False
-                for item in container_info['compilers']:
+                for item in runner_info['compilers']:
                     container_compiler_spec = CompilerSpec(item['name'])
                     if spec.compiler == container_compiler_spec:
-                        container_specs[osname]['specs'].append(spec)
+                        runner_specs[osname]['specs'].append(spec)
                         found_at_least_one = True
                 if not found_at_least_one:
                     tty.warn('No compiler in {0} satisfied {1}'.format(
                         osname, spec.compiler))
 
-    for osname in container_specs:
-        if container_specs[osname]['specs']:
-            image = container_specs[osname]['image']
-            specs = container_specs[osname]['specs']
+    for osname in runner_specs:
+        if runner_specs[osname]['specs']:
+            image = runner_specs[osname].get('image')
+            specs = runner_specs[osname]['specs']
             get_spec_dependencies(specs, deps, spec_labels, image)
 
     # Save the original deps, as we need to return them at the end of the
@@ -453,22 +470,27 @@ def compute_spec_deps(spec_list, stream_like=None):
 
 
 def release_jobs(parser, args):
-    share_path = os.path.join(spack_root, 'share', 'spack', 'docker')
-    os_container_mapping_path = os.path.join(
-        share_path, 'os-container-mapping.yaml')
+    if args.runner_mapping is None:
+        share_path = os.path.join(spack_root, 'share', 'spack', 'runners')
+        os_mapping_path = os.path.join(
+            share_path, 'os-runner-mapping.yaml')
+    else:
+        os_mapping_path = os.path.abspath(args.runner_mapping)
 
-    with open(os_container_mapping_path, 'r') as fin:
-        os_container_mapping = syaml.load(fin)
+    with open(os_mapping_path, 'r') as fin:
+        os_runner_mapping = syaml.load(fin)
+
+    print(str(os_runner_mapping))
 
     try:
-        validate(os_container_mapping, mapping_schema)
+        validate(os_runner_mapping, mapping_schema)
     except ValidationError as val_err:
-        tty.error('Ill-formed os-container-mapping configuration object')
-        tty.error(os_container_mapping)
+        tty.error('Ill-formed os-runner-mapping configuration object')
+        tty.error(os_runner_mapping)
         tty.debug(val_err)
         return
 
-    containers = os_container_mapping['containers']
+    runners = os_runner_mapping['runners']
 
     if args.specs:
         # Just print out the spec labels and all dependency edges in
@@ -494,7 +516,7 @@ def release_jobs(parser, args):
     cdash_url = args.cdash_url
 
     spec_labels, dependencies, stages = stage_spec_jobs(
-        release_spec_set, containers, current_system)
+        release_spec_set, runners, current_system)
 
     if not stages:
         tty.msg('No jobs staged, exiting.')
@@ -521,20 +543,23 @@ def release_jobs(parser, args):
 
             osname = str(release_spec.architecture)
             job_name = get_job_name(release_spec, osname)
-            container_info = containers[osname]
-            build_image = container_info['image']
 
-            job_scripts = ['./bin/rebuild-package.sh']
+            runner_info = runners[osname]
+            build_image = runner_info.get('image')
+            run_tags = runner_info.get('tags')
+            machine_vars = runner_info.get('variables', [])
 
-            if 'setup_script' in container_info:
+            job_scripts = [args.job_script]
+
+            if 'setup_script' in runner_info:
                 job_scripts.insert(
-                    0, container_info['setup_script'] % pkg_compiler)
+                    0, runner_info['setup_script'] % pkg_compiler)
 
             job_dependencies = []
             if spec_label in dependencies:
                 job_dependencies = (
                     [get_job_name(spec_labels[dep_label]['spec'], osname)
-                        for dep_label in dependencies[spec_label]])
+                     for dep_label in dependencies[spec_label]])
 
             job_object = {
                 'stage': stage_name,
@@ -546,7 +571,6 @@ def release_jobs(parser, args):
                     'ROOT_SPEC': str(root_spec),
                 },
                 'script': job_scripts,
-                'image': build_image,
                 'artifacts': {
                     'paths': [
                         'local_mirror/build_cache',
@@ -558,12 +582,21 @@ def release_jobs(parser, args):
                 'dependencies': job_dependencies,
             }
 
-            # If we see 'compilers' in the container iformation, it's a
+            if build_image is not None:
+                job_object['image'] = build_image
+
+            if run_tags is not None:
+                job_object['tags'] = run_tags
+
+            for item in machine_vars:
+                job_object['variables'][item] = machine_vars[item]
+
+            # If we see 'compilers' in the container information, it's a
             # filter for the compilers this container can handle, else we
             # assume it can handle any compiler
-            if 'compilers' in container_info:
+            if 'compilers' in runner_info:
                 do_job = False
-                for item in container_info['compilers']:
+                for item in runner_info['compilers']:
                     container_compiler_spec = CompilerSpec(item['name'])
                     if pkg_compiler == container_compiler_spec:
                         do_job = True
@@ -592,12 +625,25 @@ def release_jobs(parser, args):
         'variables': {
             'MIRROR_URL': mirror_url,
         },
-        'image': build_image,
-        'script': './bin/rebuild-index.sh',
+        'script': [args.index_script],
     }
 
     if args.shared_runner_tag:
         final_job['tags'] = [args.shared_runner_tag]
+    else:  # Use first defined runner
+        runner_info = next(itervalues(runners))
+        build_image = runner_info.get('image')
+        run_tags = runner_info.get('tags')
+        machine_vars = runner_info.get('variables', [])
+
+        if build_image is not None:
+            final_job['image'] = build_image
+
+        if run_tags is not None:
+            final_job['tags'] = run_tags
+
+        for item in machine_vars:
+            final_job['variables'][item] = machine_vars[item]
 
     output_object['rebuild-index'] = final_job
     stage_names.append(final_stage)

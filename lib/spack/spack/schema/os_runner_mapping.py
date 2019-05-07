@@ -3,20 +3,19 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Schema for os-container-mapping.yaml configuration file.
+"""Schema for os-runner-mapping.yaml configuration file.
 
-.. literalinclude:: ../spack/schema/os_container_mapping.py
+.. literalinclude:: ../spack/schema/os_runner_mapping.py
    :lines: 32-
 """
 
-
 schema = {
     '$schema': 'http://json-schema.org/schema#',
-    'title': 'Spack release builds os/container mapping config file schema',
+    'title': 'Spack release builds os/runner mapping config file schema',
     'type': 'object',
     'additionalProperties': False,
     'patternProperties': {
-        r'containers': {
+        r'runners': {
             'type': 'object',
             'default': {},
             'patternProperties': {
@@ -24,10 +23,20 @@ schema = {
                     'type': 'object',
                     'default': {},
                     'additionalProperties': False,
-                    'required': ['image'],
                     'properties': {
                         'image': {'type': 'string'},
+                        'tags': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                        },
+
                         'setup_script': {'type': 'string'},
+                        'variables': {
+                            'type': 'object',
+                            'patternProperties': {
+                                r'\w[\w-]*': {'type': 'string'},
+                            },
+                        },
                         'compilers': {
                             'type': 'array',
                             'default': [],
