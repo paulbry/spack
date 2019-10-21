@@ -35,10 +35,8 @@ class Go(Package):
 
     extendable = True
 
-    version('1.13.2', sha256='1ea68e01472e4276526902b8817abd65cf84ed921977266f0c11968d5e915f44')
     version('1.13.1', sha256='81f154e69544b9fa92b1475ff5f11e64270260d46e7e36c34aafc8bc96209358')
     version('1.13', sha256='3fc0b8b6101d42efd7da1da3029c0a13f22079c0c37ef9730209d8ec665bf122')
-    version('1.12.11', sha256='fcf58935236802929f5726e96cd1d900853b377bec2c51b2e37219c658a4950f')
     version('1.12.10', sha256='f56e48fce80646d3c94dcf36d3e3f490f6d541a92070ad409b87b6bbb9da3954')
     version('1.12.9', sha256='ab0e56ed9c4732a653ed22e232652709afbf573e710f56a07f7fdeca578d62fc')
     version('1.12.8', sha256='11ad2e2e31ff63fcf8a2bdffbe9bfa2e1845653358daed593c8c2d03453c9898')
@@ -65,7 +63,6 @@ class Go(Package):
     version('1.7.5',  '506de2d870409e9003e1440bcfeb3a65')
     version('1.7.4',  '49c1076428a5d3b5ad7ac65233fcca2f')
     version('1.6.4',  'b023240be707b34059d2c114d3465c92')
-
     provides('golang')
 
     depends_on('git', type=('build', 'link', 'run'))
@@ -106,12 +103,13 @@ class Go(Package):
 
         install_tree(wd, prefix)
 
-    def setup_environment(self, spack_env, run_env):
-        spack_env.set('GOROOT_FINAL', self.spec.prefix)
+
+    def setup_build_environment(self, env):
+        env.set('GOROOT_FINAL', self.spec.prefix)
         # We need to set CC/CXX_FOR_TARGET, otherwise cgo will use the
         # internal Spack wrappers and fail.
-        spack_env.set('CC_FOR_TARGET', self.compiler.cc)
-        spack_env.set('CXX_FOR_TARGET', self.compiler.cxx)
+        env.set('CC_FOR_TARGET', self.compiler.cc)
+        env.set('CXX_FOR_TARGET', self.compiler.cxx)
 
     def setup_dependent_package(self, module, dependent_spec):
         """Called before go modules' install() methods.
@@ -125,19 +123,19 @@ class Go(Package):
         #  Add a go command/compiler for extensions
         module.go = self.spec['go'].command
 
-    def setup_dependent_environment(self, spack_env, run_env, dependent_spec):
+    def setup_run_environment(self, env):
         if os.environ.get('GOROOT', False):
             tty.warn('GOROOT is set, this is not recommended')
 
         path_components = []
         # Set GOPATH to include paths of dependencies
-        for d in dependent_spec.traverse():
+        for d in self.dependent_spec.traverse():
             if d.package.extends(self.spec):
                 path_components.append(d.prefix)
 
         # This *MUST* be first, this is where new code is installed
-        spack_env.set('GOPATH', ':'.join(path_components))
+        env.set('GOPATH', ':'.join(path_components))
 
         # Allow packages to find this when using module files
-        run_env.prepend_path('GOPATH', ':'.join(
-            [dependent_spec.prefix] + path_components))
+        env.prepend_path('GOPATH', ':'.join(
+            [self.dependent_spec.prefix] + path_components))
